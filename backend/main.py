@@ -1,9 +1,10 @@
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -14,6 +15,7 @@ from observability import create_run_payload
 
 
 app = FastAPI(title="Navigator AI")
+logger = logging.getLogger("uvicorn.error")
 
 frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
 allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -36,11 +38,48 @@ class TaskRequest(BaseModel):
 # In-memory state is intentional for this hackathon dashboard. It avoids adding
 # infrastructure while letting the UI poll only user-facing execution status.
 runs: dict[str, dict] = {}
+active_tasks: set[asyncio.Task] = set()
 latest_run_id: str | None = None
+# Browser previews are deliberately transient. Execution history continues to
+# contain only the existing safe run metadata.
+run_connections: dict[str, set[WebSocket]] = {}
+latest_screenshots: dict[str, str] = {}
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def schedule_broadcast(run_id: str, event: dict) -> None:
+    """Publish without delaying Browser Use callbacks or the agent action loop."""
+    try:
+        asyncio.get_running_loop().create_task(broadcast_run_event(run_id, event))
+    except RuntimeError:
+        # This only occurs outside an active ASGI event loop (for example a
+        # synchronous unit test); the run state remains available via REST.
+        return
+
+
+async def broadcast_run_event(run_id: str, event: dict) -> None:
+    stale_connections: list[WebSocket] = []
+    for connection in tuple(run_connections.get(run_id, set())):
+        try:
+            await connection.send_json(event)
+        except (RuntimeError, WebSocketDisconnect):
+            stale_connections.append(connection)
+        except Exception as exc:
+            # A disconnected preview client must never affect the agent run.
+            logger.debug("[Navigator] Browser preview delivery failed: %s", type(exc).__name__)
+            stale_connections.append(connection)
+    for connection in stale_connections:
+        run_connections.get(run_id, set()).discard(connection)
+
+
+def publish_browser_preview(run_id: str, event: dict) -> None:
+    """Keep only the latest real Chromium screenshot in memory for a run."""
+    if event.get("type") == "browser_screenshot" and isinstance(event.get("image"), str):
+        latest_screenshots[run_id] = event["image"]
+    schedule_broadcast(run_id, {**event, "run_id": run_id})
 
 
 def emit(
@@ -71,12 +110,14 @@ def emit(
     run["events"].append(event)
     if event_type == "recovery":
         run["recovery_events"].append(event)
+    schedule_broadcast(run_id, {"type": "browser_status", "run_id": run_id, "status": run.get("status", "queued"), "event": event})
 
 
 async def execute_run(run_id: str, task: str) -> None:
     run = runs[run_id]
     run["status"] = "running"
     run["started_at"] = now()
+    logger.info("[Navigator] Starting browser agent for run %s", run_id)
     emit(run_id, "decision", "Understanding user request", "Plan the browser workflow", "UNDERSTAND")
     try:
         result = await run_task(
@@ -84,29 +125,36 @@ async def execute_run(run_id: str, task: str) -> None:
             status_callback=lambda message, next_action=None, state=None, event_type="decision": emit(
                 run_id, event_type, message, next_action, state
             ),
+            preview_callback=lambda event: publish_browser_preview(run_id, event),
         )
+        if result is None or not str(result).strip():
+            raise RuntimeError("Browser agent returned no final result")
         run["status"] = "completed"
         run["result"] = result
+        logger.info("[Navigator] Agent execution completed for run %s", run_id)
         emit(run_id, "safety", "Workflow finished with the safety guard active", "Stop before reservation or payment", "COMPLETE")
     except asyncio.CancelledError:
         run["status"] = "cancelled"
         run["error"] = "The task was cancelled before completion."
+        logger.warning("[Navigator] Agent execution cancelled for run %s", run_id)
         emit(run_id, "error", "Browser task was cancelled", "Return to the dashboard and try again", "ERROR")
         raise
     except Exception as exc:
         # Keep operational details out of the dashboard and server response.
         run["status"] = "failed"
-        run["error"] = "The browser session could not complete. Please try again."
+        run["error"] = "Browser agent encountered an error. Please try again."
         emit(run_id, "error", "Browser session could not complete", "Review the task and retry", "ERROR")
-        print(f"Navigator run {run_id} failed: {type(exc).__name__}")
+        logger.warning("[Navigator] Agent execution failed for run %s: %s", run_id, type(exc).__name__)
     finally:
         run["completed_at"] = now()
         try:
             save_run(run)
             run["saved_to_history"] = True
+            logger.info("[Navigator] Run saved to execution history: %s", run_id)
         except Exception as exc:
             run["saved_to_history"] = False
-            print(f"Navigator run {run_id} could not be saved: {type(exc).__name__}")
+            logger.warning("[Navigator] Run history save failed for %s: %s", run_id, type(exc).__name__)
+        schedule_broadcast(run_id, {"type": "browser_status", "run_id": run_id, "status": run["status"]})
 
 
 @app.get("/")
@@ -122,12 +170,38 @@ async def run_agent(request: TaskRequest):
         raise HTTPException(status_code=422, detail="Task cannot be empty")
 
     run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+    logger.info("[Navigator] Task received for run %s", run_id)
     run = create_run_payload(task)
     run["id"] = run_id
     runs[run_id] = run
     latest_run_id = run_id
-    asyncio.create_task(execute_run(run_id, task))
+    execution_task = asyncio.create_task(execute_run(run_id, task))
+    active_tasks.add(execution_task)
+    execution_task.add_done_callback(active_tasks.discard)
     return run
+
+
+@app.websocket("/ws/runs/{run_id}")
+async def run_websocket(websocket: WebSocket, run_id: str):
+    """Stream only safe browser status and the latest in-memory preview image."""
+    if run_id not in runs:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    run_connections.setdefault(run_id, set()).add(websocket)
+    try:
+        await websocket.send_json({"type": "browser_status", "run_id": run_id, "status": runs[run_id].get("status", "queued")})
+        if screenshot := latest_screenshots.get(run_id):
+            await websocket.send_json({"type": "browser_screenshot", "run_id": run_id, "image": screenshot})
+        while True:
+            # The client need not send data. Waiting here keeps the socket open
+            # while screenshot broadcasts are sent by independent tasks.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        run_connections.get(run_id, set()).discard(websocket)
 
 
 @app.get("/runs/{run_id}")

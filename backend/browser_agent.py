@@ -1,12 +1,17 @@
 import asyncio
+import base64
+import inspect
+import logging
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 from dotenv import load_dotenv
 from browser_use import Agent, Browser, ChatGoogle
 
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
 TASK = """
 You are Navigator AI, an autonomous browser-use agent.
@@ -66,11 +71,12 @@ WORKING STYLE:
 async def run_task(
     task: str,
     status_callback: Callable[[str, str | None, str | None, str], None] | None = None,
+    preview_callback: Callable[[dict], Any] | None = None,
 ):
     print("=" * 60)
     print("NAVIGATOR AI - AUTONOMOUS AIRBNB AGENT")
     print("=" * 60)
-    print("\nStarting browser agent...\n")
+    logger.info("[Navigator] Initializing browser agent")
 
     if status_callback:
         status_callback("Planning browser workflow", "Launch Airbnb and prepare the search", "PLAN", "decision")
@@ -106,11 +112,47 @@ async def run_task(
         browser=browser,
         register_new_step_callback=report_browser_step,
     )
+    logger.info("[Navigator] Browser agent initialized")
+
+    async def capture_browser_previews() -> None:
+        """Capture the existing Browser Use Chromium session at a modest rate."""
+        preview_error_reported = False
+        while True:
+            try:
+                screenshot = await browser.take_screenshot(format="jpeg", quality=65)
+                if preview_callback:
+                    callback_result = preview_callback(
+                        {
+                            "type": "browser_screenshot",
+                            "image": "data:image/jpeg;base64," + base64.b64encode(screenshot).decode("ascii"),
+                        }
+                    )
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                preview_error_reported = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[Navigator] Browser screenshot capture failed: %s", type(exc).__name__)
+                if preview_callback and not preview_error_reported:
+                    callback_result = preview_callback({"type": "browser_preview_unavailable"})
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                preview_error_reported = True
+            await asyncio.sleep(1.5)
 
     if status_callback:
         status_callback("Observing Airbnb", "Inspect the current page before interacting", "OBSERVE", "decision")
 
-    history = await agent.run(max_steps=30)
+    logger.info("[Navigator] Agent execution started")
+    preview_task = asyncio.create_task(capture_browser_previews()) if preview_callback else None
+    try:
+        history = await agent.run(max_steps=30)
+    finally:
+        if preview_task:
+            preview_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await preview_task
 
     print("\n" + "=" * 60)
     print("NAVIGATOR AI - FINAL RESULT")
@@ -119,6 +161,8 @@ async def run_task(
     result = history.final_result()
 
     print(result)
+    if result is None or not str(result).strip():
+        logger.warning("[Navigator] Agent execution ended without a final result")
     if status_callback:
         status_callback("Verifying the selected listing", "Stop before reservation or payment", "VERIFY", "decision")
     return result
