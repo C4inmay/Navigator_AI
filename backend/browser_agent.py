@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -77,7 +78,7 @@ async def run_task(
     llm = ChatGoogle(model="gemini-3.5-flash")
 
     browser = Browser(
-        headless=False,
+        headless=os.getenv("BROWSER_USE_HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"},
         window_size={
             "width": 1400,
             "height": 900,

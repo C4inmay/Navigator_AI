@@ -1,0 +1,6 @@
+.env
+venv/
+.browseruse/
+__pycache__/
+*.py[cod]
+data/runs/

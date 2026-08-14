@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -14,9 +15,14 @@ from observability import create_run_payload
 
 app = FastAPI(title="Navigator AI")
 
+frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if frontend_url and frontend_url not in allowed_origins:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
