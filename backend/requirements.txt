@@ -1,0 +1,5 @@
+# Runtime dependencies for Navigator AI's FastAPI + Browser Use backend.
+browser-use==0.13.7
+fastapi==0.141.1
+python-dotenv==1.2.2
+uvicorn==0.52.3

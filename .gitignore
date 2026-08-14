@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Browser Use
+.browseruse/
+
+# Node
+node_modules/
+dist/
+
+# Local execution history
+backend/data/runs/*
+!backend/data/runs/.gitkeep
+
+# OS / IDE
+.DS_Store
+.vscode/
